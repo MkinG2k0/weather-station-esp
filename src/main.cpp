@@ -2,19 +2,22 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_BMP280.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
 #include <PNGdec.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <cmath>
 #include <cstring>
-#include <ctime>
 #include <vector>
 
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
+#include "esp_wifi.h"
+
+extern "C" {
+#include "lwip/netdb.h"
+#include "lwip/netif.h"
+}
 
 #include <GxEPD2_3C.h>
 
@@ -63,13 +66,6 @@ constexpr uint32_t MAX_REFRESH_INTERVAL_SECONDS = 24UL * 60UL * 60UL;
 constexpr size_t MAX_PNG_SIZE = 64UL * 1024UL;
 constexpr int IMAGE_WIDTH = 800;
 constexpr int IMAGE_HEIGHT = 480;
-// Long history lives on the server. Keep a small catch-up buffer in DRAM/NVS
-// so a missed screen.png still uploads recent BMP samples without overflowing
-// ESP32 RAM (~8.6 KB for 1440 packed points).
-constexpr uint16_t TEMP_LOG_MAX_POINTS = 48;
-constexpr uint32_t TEMP_LOG_MAX_AGE_SEC = 2UL * 24UL * 3600UL;
-constexpr uint16_t TEMP_LOG_SEND_POINTS = 48;
-constexpr uint32_t NTP_MIN_UNIX = 1600000000UL;
 constexpr int STATUS_LED = 2; // FireBeetle onboard LED, D9 / IO2
 
 // 80 display rows per page keep the PNG decoder in static memory and avoid
@@ -117,110 +113,6 @@ struct BatteryReading
 
 BatteryReading latestBattery;
 
-struct TempSample
-{
-  uint32_t unix;
-  int16_t tenth;
-} __attribute__((packed));
-
-TempSample tempLog[TEMP_LOG_MAX_POINTS];
-uint16_t tempLogCount = 0;
-
-void loadTemperatureLog()
-{
-  tempLogCount = 0;
-  Preferences prefs;
-  if (!prefs.begin("templog", true))
-  {
-    return;
-  }
-  const size_t length = prefs.getBytesLength("blob");
-  if (length >= sizeof(TempSample) && (length % sizeof(TempSample)) == 0 &&
-      length <= sizeof(tempLog))
-  {
-    prefs.getBytes("blob", tempLog, length);
-    tempLogCount = static_cast<uint16_t>(length / sizeof(TempSample));
-  }
-  prefs.end();
-}
-
-void saveTemperatureLog()
-{
-  Preferences prefs;
-  if (!prefs.begin("templog", false))
-  {
-    return;
-  }
-  prefs.putBytes("blob", tempLog, tempLogCount * sizeof(TempSample));
-  prefs.end();
-}
-
-void pruneTemperatureLog(uint32_t nowUnix)
-{
-  uint16_t write = 0;
-  for (uint16_t read = 0; read < tempLogCount; ++read)
-  {
-    if (nowUnix >= tempLog[read].unix && nowUnix - tempLog[read].unix <= TEMP_LOG_MAX_AGE_SEC)
-    {
-      tempLog[write++] = tempLog[read];
-    }
-  }
-  tempLogCount = write;
-}
-
-void appendTemperatureSample(uint32_t nowUnix, float temperatureC)
-{
-  loadTemperatureLog();
-  pruneTemperatureLog(nowUnix);
-  const int16_t tenth = static_cast<int16_t>(lroundf(temperatureC * 10.0f));
-  if (tempLogCount > 0 && tempLog[tempLogCount - 1].unix / 60 == nowUnix / 60)
-  {
-    tempLog[tempLogCount - 1].tenth = tenth;
-    tempLog[tempLogCount - 1].unix = nowUnix;
-  }
-  else if (tempLogCount < TEMP_LOG_MAX_POINTS)
-  {
-    tempLog[tempLogCount++] = TempSample{nowUnix, tenth};
-  }
-  else
-  {
-    memmove(tempLog, tempLog + 1, (TEMP_LOG_MAX_POINTS - 1) * sizeof(TempSample));
-    tempLog[TEMP_LOG_MAX_POINTS - 1] = TempSample{nowUnix, tenth};
-  }
-  saveTemperatureLog();
-}
-
-String encodeTemperatureHist()
-{
-  if (tempLogCount == 0)
-  {
-    loadTemperatureLog();
-  }
-  if (tempLogCount == 0)
-  {
-    return "";
-  }
-  const uint16_t start = tempLogCount > TEMP_LOG_SEND_POINTS ? tempLogCount - TEMP_LOG_SEND_POINTS : 0;
-  String encoded;
-  encoded.reserve((tempLogCount - start) * 10);
-  encoded += String(tempLog[start].unix);
-  encoded += ',';
-  encoded += String(tempLog[start].tenth);
-  for (uint16_t index = start + 1; index < tempLogCount; ++index)
-  {
-    int32_t minutes = static_cast<int32_t>(tempLog[index].unix - tempLog[index - 1].unix) / 60;
-    if (minutes < 0)
-    {
-      minutes = 0;
-    }
-    encoded += ',';
-    encoded += String(minutes);
-    encoded += ',';
-    encoded += String(tempLog[index].tenth);
-  }
-  return encoded;
-}
-
 void blinkStatusLed(int times)
 {
   pinMode(STATUS_LED, OUTPUT);
@@ -231,23 +123,6 @@ void blinkStatusLed(int times)
     digitalWrite(STATUS_LED, LOW);
     delay(160);
   }
-}
-
-bool syncNetworkTime()
-{
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
-  for (int attempt = 0; attempt < 50; ++attempt)
-  {
-    const time_t now = time(nullptr);
-    if (now > static_cast<time_t>(NTP_MIN_UNIX))
-    {
-      Serial.printf("NTP unix %ld\n", static_cast<long>(now));
-      return true;
-    }
-    delay(200);
-  }
-  Serial.println("NTP failed");
-  return false;
 }
 
 void powerOffEnvironmentSensor()
@@ -772,11 +647,6 @@ String screenshotQuery()
   {
     appendQueryParam(query, "batt_pct", String(latestBattery.percent));
   }
-  const String hist = encodeTemperatureHist();
-  if (hist.length() > 0)
-  {
-    appendQueryParam(query, "hist", hist);
-  }
   return query;
 }
 
@@ -815,8 +685,24 @@ bool connectWiFi()
 
   Serial.print("Wi-Fi connected, IP: ");
   Serial.println(WiFi.localIP());
-  Serial.printf("Free heap before HTTPS: %u bytes\n",
-                static_cast<unsigned>(ESP.getFreeHeap()));
+  // begin() can re-enable modem sleep after association; keep the radio awake
+  // for SYN/ACK or the TCP handshake aborts with errno 113.
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  // Do not call WiFi.config() here: converting a DHCP lease to static often
+  // drops the default route while DNS still "works" via the router proxy.
+  if (netif_default != nullptr)
+  {
+    netif_default->mtu = 1400;
+  }
+  Serial.printf("GW %s mask %s DNS %s RSSI %d dBm\n",
+                WiFi.gatewayIP().toString().c_str(),
+                WiFi.subnetMask().toString().c_str(),
+                WiFi.dnsIP().toString().c_str(), WiFi.RSSI());
+  Serial.printf("Free heap before HTTPS: %u (maxAlloc %u)\n",
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxAllocHeap()));
   delay(250);
   return true;
 }
@@ -859,15 +745,120 @@ void applyRefreshHeader(const String& value, uint32_t& refreshSeconds)
   }
 }
 
+bool parseHttpsHost(const String& url, String& host, uint16_t& port)
+{
+  if (!url.startsWith("https://"))
+  {
+    return false;
+  }
+  const String rest = url.substring(8);
+  const int slash = rest.indexOf('/');
+  const String hostPort = slash < 0 ? rest : rest.substring(0, slash);
+  const int colon = hostPort.indexOf(':');
+  if (colon >= 0)
+  {
+    host = hostPort.substring(0, colon);
+    port = static_cast<uint16_t>(hostPort.substring(colon + 1).toInt());
+    if (port == 0)
+    {
+      port = 443;
+    }
+  }
+  else
+  {
+    host = hostPort;
+    port = 443;
+  }
+  return host.length() > 0;
+}
+
+bool ipAlreadyListed(const std::vector<IPAddress>& ips, const IPAddress& ip)
+{
+  for (const auto& existing : ips)
+  {
+    if (existing == ip)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void collectIpv4(const char* hostname, std::vector<IPAddress>& ips)
+{
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* result = nullptr;
+  if (getaddrinfo(hostname, "443", &hints, &result) != 0 || result == nullptr)
+  {
+    Serial.printf("DNS IPv4 failed for %s\n", hostname);
+    return;
+  }
+  for (struct addrinfo* item = result; item != nullptr; item = item->ai_next)
+  {
+    if (item->ai_family != AF_INET || item->ai_addr == nullptr)
+    {
+      continue;
+    }
+    const auto* address = reinterpret_cast<const sockaddr_in*>(item->ai_addr);
+    const IPAddress ip(address->sin_addr.s_addr);
+    if (static_cast<uint32_t>(ip) == 0 || ipAlreadyListed(ips, ip))
+    {
+      continue;
+    }
+    ips.push_back(ip);
+    Serial.printf("Resolved %s -> %s\n", hostname, ip.toString().c_str());
+  }
+  freeaddrinfo(result);
+}
+
+void addFallbackIp(std::vector<IPAddress>& ips, uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+{
+  const IPAddress ip(a, b, c, d);
+  if (!ipAlreadyListed(ips, ip))
+  {
+    ips.push_back(ip);
+    Serial.printf("Fallback Vercel IP %s\n", ip.toString().c_str());
+  }
+}
+
+void addVercelFallbackIps(std::vector<IPAddress>& ips)
+{
+  collectIpv4("cname.vercel-dns.com", ips);
+  addFallbackIp(ips, 76, 76, 21, 21);
+  addFallbackIp(ips, 76, 76, 21, 22);
+  addFallbackIp(ips, 66, 33, 60, 34);
+}
+
 DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image,
                                   String& responseEtag, uint32_t& refreshSeconds)
 {
+  String host;
+  uint16_t port = 443;
+  if (!parseHttpsHost(screenshotUrl, host, port))
+  {
+    showError("Invalid or unsupported link", screenshotUrl);
+    return DownloadResult::failed;
+  }
+
+  std::vector<IPAddress> ips;
+  ips.reserve(8);
+  collectIpv4(host.c_str(), ips);
+  if (ips.empty())
+  {
+    showError("Server connection failed", "DNS returned no IPv4 address");
+    return DownloadResult::failed;
+  }
+
   WiFiClientSecure client;
   client.setInsecure(); // Test firmware: accept Vercel's current TLS certificate chain.
-  client.setHandshakeTimeout(30);
+  client.setHandshakeTimeout(20);
+  client.setTimeout(8);
 
   HTTPClient http;
-  http.setConnectTimeout(25000);
+  http.setConnectTimeout(8000);
   http.setTimeout(DOWNLOAD_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   const char* responseHeaders[] = {"Content-Type", "ETag", "X-Next-Refresh-Seconds"};
@@ -875,28 +866,42 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
 
   Serial.printf("GET %s\n", screenshotUrl.c_str());
   int status = -1;
-  for (int attempt = 1; attempt <= 3; ++attempt)
+  for (int round = 1; round <= 2 && status <= 0; ++round)
   {
-    if (!http.begin(client, screenshotUrl))
+    if (round == 2)
     {
-      showError("Invalid or unsupported link", screenshotUrl);
-      return DownloadResult::failed;
+      addVercelFallbackIps(ips);
     }
-    if (lastScreenEtag[0] != '\0')
+    for (const auto& ip : ips)
     {
-      http.addHeader("If-None-Match", lastScreenEtag);
+      client.stop();
+      if (!http.begin(client, screenshotUrl))
+      {
+        showError("Invalid or unsupported link", screenshotUrl);
+        return DownloadResult::failed;
+      }
+      Serial.printf("HTTPS %s (%s:%u) round %d\n", host.c_str(), ip.toString().c_str(),
+                    static_cast<unsigned>(port), round);
+      if (client.connect(ip, port, host.c_str(), nullptr, nullptr, nullptr) != 1)
+      {
+        Serial.printf("TCP/TLS failed, heap %u\n", static_cast<unsigned>(ESP.getFreeHeap()));
+        http.end();
+        continue;
+      }
+      if (lastScreenEtag[0] != '\0')
+      {
+        http.addHeader("If-None-Match", lastScreenEtag);
+      }
+      status = http.GET();
+      if (status > 0)
+      {
+        break;
+      }
+      Serial.printf("HTTPS GET failed: %d (%s), heap %u\n", status,
+                    http.errorToString(status).c_str(),
+                    static_cast<unsigned>(ESP.getFreeHeap()));
+      http.end();
     }
-
-    status = http.GET();
-    if (status > 0)
-    {
-      break;
-    }
-    Serial.printf("HTTPS attempt %d failed: %d (%s), heap %u\n", attempt, status,
-                  http.errorToString(status).c_str(),
-                  static_cast<unsigned>(ESP.getFreeHeap()));
-    http.end();
-    delay(750 * attempt);
   }
   if (status <= 0)
   {
@@ -956,6 +961,7 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
   }
 
   image.clear();
+  image.reserve(MAX_PNG_SIZE);
   if (contentLength < 0)
   {
     // Vercel commonly uses chunked transfer encoding, where Content-Length is -1.
@@ -1109,12 +1115,6 @@ bool refreshScreen(uint32_t& refreshSeconds)
     return false;
   }
 
-  loadTemperatureLog();
-  if (syncNetworkTime() && latestEnvironment.available)
-  {
-    appendTemperatureSample(static_cast<uint32_t>(time(nullptr)), latestEnvironment.temperatureC);
-  }
-
   const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png" + screenshotQuery();
   logSensorReading();
   String responseEtag;
@@ -1172,11 +1172,6 @@ void setup()
   // charging is onboard. Firmware only reads the sensor and battery ADC.
   readOptionalEnvironmentSensor();
   readOptionalBattery();
-
-  // Allocate the download buffer before Wi-Fi/TLS can fragment the heap.
-  downloadBuffer.reserve(MAX_PNG_SIZE);
-  Serial.printf("PNG buffer reserved: %u bytes\n",
-                static_cast<unsigned>(downloadBuffer.capacity()));
 
   uint32_t refreshSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
   const bool refreshed = refreshScreen(refreshSeconds);
