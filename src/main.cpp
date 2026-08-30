@@ -79,6 +79,7 @@ struct EnvironmentReading
   float temperatureC = 0.0f;
   float pressureHpa = 0.0f;
   float humidityPercent = 0.0f;
+  float altitudeM = 0.0f;
 };
 
 EnvironmentReading latestEnvironment;
@@ -162,9 +163,10 @@ void readOptionalEnvironmentSensor()
     latestEnvironment.temperatureC = bme280.readTemperature();
     latestEnvironment.pressureHpa = bme280.readPressure() / 100.0f;
     latestEnvironment.humidityPercent = bme280.readHumidity();
-    Serial.printf("BME280 at 0x%02X: %.1f C, %.1f hPa, %.1f %%RH\n", address,
+    latestEnvironment.altitudeM = bme280.readAltitude(1013.25f);
+    Serial.printf("BME280 at 0x%02X: %.1f C, %.1f hPa, %.1f %%RH, %.0f m\n", address,
                   latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
-                  latestEnvironment.humidityPercent);
+                  latestEnvironment.humidityPercent, latestEnvironment.altitudeM);
   }
   else if ((chipId == BMP280_CHIP_ID || chipId == 0) && bmp280.begin(address))
   {
@@ -175,8 +177,10 @@ void readOptionalEnvironmentSensor()
     latestEnvironment.available = true;
     latestEnvironment.temperatureC = bmp280.readTemperature();
     latestEnvironment.pressureHpa = bmp280.readPressure() / 100.0f;
-    Serial.printf("BMP280 at 0x%02X: %.1f C, %.1f hPa\n", address,
-                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa);
+    latestEnvironment.altitudeM = bmp280.readAltitude(1013.25f);
+    Serial.printf("BMP280 at 0x%02X: %.1f C, %.1f hPa, %.0f m\n", address,
+                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
+                  latestEnvironment.altitudeM);
   }
   else
   {
@@ -297,6 +301,29 @@ private:
   std::vector<uint8_t>& target_;
   bool overflowed_ = false;
 };
+
+String screenshotQuery()
+{
+  if (!latestEnvironment.available)
+  {
+    return "";
+  }
+
+  String query = "?chip=";
+  query += latestEnvironment.hasHumidity ? "bme280" : "bmp280";
+  query += "&temp_c=";
+  query += String(latestEnvironment.temperatureC, 2);
+  query += "&pressure_hpa=";
+  query += String(latestEnvironment.pressureHpa, 2);
+  query += "&altitude_m=";
+  query += String(latestEnvironment.altitudeM, 1);
+  if (latestEnvironment.hasHumidity)
+  {
+    query += "&humidity=";
+    query += String(latestEnvironment.humidityPercent, 1);
+  }
+  return query;
+}
 
 bool connectWiFi()
 {
@@ -603,7 +630,7 @@ bool refreshScreen(uint32_t& refreshSeconds)
     return false;
   }
 
-  const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png";
+  const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png" + screenshotQuery();
   String responseEtag;
   const DownloadResult result = downloadScreenshot(
       screenshotUrl, downloadBuffer, responseEtag, refreshSeconds);
