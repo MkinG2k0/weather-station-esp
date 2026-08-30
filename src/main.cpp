@@ -4,7 +4,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
 #include <cstring>
 #include <vector>
 
@@ -25,8 +24,10 @@ constexpr int EPD_BUSY = 14;
 
 constexpr uint32_t WIFI_TIMEOUT_MS = 30000;
 constexpr uint32_t DOWNLOAD_TIMEOUT_MS = 30000;
-constexpr uint32_t DEFAULT_REFRESH_INTERVAL_MS = 10UL * 60UL * 1000UL;
-constexpr uint32_t RETRY_INTERVAL_MS = 30UL * 1000UL;
+constexpr uint32_t DEFAULT_REFRESH_INTERVAL_SECONDS = 10UL * 60UL;
+constexpr uint32_t RETRY_INTERVAL_SECONDS = 30UL;
+constexpr uint32_t MIN_REFRESH_INTERVAL_SECONDS = 5UL * 60UL;
+constexpr uint32_t MAX_REFRESH_INTERVAL_SECONDS = 24UL * 60UL * 60UL;
 constexpr size_t MAX_PNG_SIZE = 64UL * 1024UL;
 constexpr int IMAGE_WIDTH = 800;
 constexpr int IMAGE_HEIGHT = 480;
@@ -39,8 +40,17 @@ PNG* activePng = nullptr;
 PNG pngDecoder;
 uint16_t rgbLine[IMAGE_WIDTH];
 std::vector<uint8_t> downloadBuffer;
-uint32_t nextRefreshAt = 0;
-uint32_t refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS;
+
+RTC_DATA_ATTR char lastScreenEtag[72] = "";
+RTC_DATA_ATTR uint32_t lastImageHash = 0;
+RTC_DATA_ATTR bool hasLastImageHash = false;
+
+enum class DownloadResult
+{
+  downloaded,
+  notModified,
+  failed,
+};
 
 class VectorWriteStream : public Stream
 {
@@ -79,7 +89,8 @@ bool connectWiFi()
 
   Serial.printf("Connecting to Wi-Fi %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
+  WiFi.setAutoReconnect(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   const uint32_t startedAt = millis();
@@ -101,62 +112,46 @@ bool connectWiFi()
   return true;
 }
 
-bool fetchDeviceConfig(String& screenUrl)
+void stopWiFi()
 {
-  screenUrl = String(DEVICE_BASE_URL) + "/screen.png";
-  if (DEVICE_BASE_URL[0] == '\0')
-  {
-    Serial.println("DEVICE_BASE_URL is empty; copy it from E-Ink Control Desk");
-    return false;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setConnectTimeout(15000);
-  http.setTimeout(DOWNLOAD_TIMEOUT_MS);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  const String configUrl = String(DEVICE_BASE_URL) + "/config";
-  Serial.printf("GET %s\n", configUrl.c_str());
-  if (!http.begin(client, configUrl))
-  {
-    Serial.println("Config HTTPS initialization failed");
-    return false;
-  }
-
-  const int status = http.GET();
-  if (status != HTTP_CODE_OK)
-  {
-    Serial.printf("Config HTTP error: %d\n", status);
-    http.end();
-    return false;
-  }
-
-  JsonDocument config;
-  const DeserializationError error = deserializeJson(config, http.getString());
-  http.end();
-  if (error)
-  {
-    Serial.printf("Config JSON error: %s\n", error.c_str());
-    return false;
-  }
-
-  const uint32_t seconds = config["refreshIntervalSeconds"] | 600U;
-  if (seconds >= 300U && seconds <= 86400U)
-  {
-    refreshIntervalMs = seconds * 1000UL;
-  }
-  const char* configuredScreen = config["screenUrl"] | "";
-  if (configuredScreen[0] != '\0')
-  {
-    screenUrl = configuredScreen;
-  }
-  Serial.printf("Config loaded: refresh every %lu seconds\n",
-                static_cast<unsigned long>(refreshIntervalMs / 1000UL));
-  return true;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
 }
 
-bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image)
+uint32_t fnv1a(const std::vector<uint8_t>& data)
+{
+  uint32_t hash = 2166136261UL;
+  for (const uint8_t value : data)
+  {
+    hash ^= value;
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+void rememberEtag(const String& etag)
+{
+  if (etag.isEmpty())
+  {
+    lastScreenEtag[0] = '\0';
+    return;
+  }
+  strncpy(lastScreenEtag, etag.c_str(), sizeof(lastScreenEtag) - 1);
+  lastScreenEtag[sizeof(lastScreenEtag) - 1] = '\0';
+}
+
+void applyRefreshHeader(const String& value, uint32_t& refreshSeconds)
+{
+  const long seconds = value.toInt();
+  if (seconds >= static_cast<long>(MIN_REFRESH_INTERVAL_SECONDS) &&
+      seconds <= static_cast<long>(MAX_REFRESH_INTERVAL_SECONDS))
+  {
+    refreshSeconds = static_cast<uint32_t>(seconds);
+  }
+}
+
+DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image,
+                                  String& responseEtag, uint32_t& refreshSeconds)
 {
   WiFiClientSecure client;
   client.setInsecure(); // Test firmware: accept Vercel's current TLS certificate chain.
@@ -165,24 +160,37 @@ bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image
   http.setConnectTimeout(15000);
   http.setTimeout(DOWNLOAD_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  const char* responseHeaders[] = {"Content-Type"};
-  http.collectHeaders(responseHeaders, 1);
+  const char* responseHeaders[] = {"Content-Type", "ETag", "X-Next-Refresh-Seconds"};
+  http.collectHeaders(responseHeaders, 3);
 
   Serial.printf("GET %s\n", screenshotUrl.c_str());
   if (!http.begin(client, screenshotUrl))
   {
     Serial.println("HTTPS initialization failed");
-    return false;
+    return DownloadResult::failed;
+  }
+  if (lastScreenEtag[0] != '\0')
+  {
+    http.addHeader("If-None-Match", lastScreenEtag);
   }
 
   const int status = http.GET();
+  applyRefreshHeader(http.header("X-Next-Refresh-Seconds"), refreshSeconds);
+  if (status == HTTP_CODE_NOT_MODIFIED)
+  {
+    Serial.printf("Screen unchanged (ETag), next check in %lu seconds\n",
+                  static_cast<unsigned long>(refreshSeconds));
+    http.end();
+    return DownloadResult::notModified;
+  }
   if (status != HTTP_CODE_OK)
   {
     Serial.printf("HTTP error: %d (%s)\n", status, http.errorToString(status).c_str());
     http.end();
-    return false;
+    return DownloadResult::failed;
   }
 
+  responseEtag = http.header("ETag");
   const int contentLength = http.getSize();
   const String contentType = http.header("Content-Type");
   Serial.printf("HTTP 200, Content-Type: %s, Content-Length: %d\n",
@@ -191,13 +199,13 @@ bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image
   {
     Serial.printf("Invalid Content-Length: %d\n", contentLength);
     http.end();
-    return false;
+    return DownloadResult::failed;
   }
   if (!contentType.startsWith("image/png"))
   {
     Serial.printf("Unexpected Content-Type: %s\n", contentType.c_str());
     http.end();
-    return false;
+    return DownloadResult::failed;
   }
 
   image.clear();
@@ -214,7 +222,7 @@ bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image
       Serial.printf("Chunked download failed: result=%d, size=%u\n", written,
                     static_cast<unsigned>(image.size()));
       image.clear();
-      return false;
+      return DownloadResult::failed;
     }
   }
   else
@@ -250,7 +258,7 @@ bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image
       Serial.printf("Incomplete download: %u/%u bytes\n",
                     static_cast<unsigned>(received), static_cast<unsigned>(image.size()));
       image.clear();
-      return false;
+      return DownloadResult::failed;
     }
   }
 
@@ -260,11 +268,11 @@ bool downloadScreenshot(const String& screenshotUrl, std::vector<uint8_t>& image
   {
     Serial.println("Downloaded data is not a PNG file");
     image.clear();
-    return false;
+    return DownloadResult::failed;
   }
 
   Serial.printf("PNG downloaded: %u bytes\n", static_cast<unsigned>(image.size()));
-  return true;
+  return DownloadResult::downloaded;
 }
 
 int drawPngLine(PNGDRAW* draw)
@@ -306,6 +314,7 @@ bool showPng(const std::vector<uint8_t>& image)
   }
 
   Serial.println("Rendering PNG to E-Ink framebuffer");
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200);
   display.setRotation(0);
   display.setFullWindow();
@@ -322,6 +331,7 @@ bool showPng(const std::vector<uint8_t>& image)
       activePng->close();
       activePng = nullptr;
       display.hibernate();
+      SPI.end();
       return false;
     }
   }
@@ -330,24 +340,65 @@ bool showPng(const std::vector<uint8_t>& image)
   activePng->close();
   activePng = nullptr;
   display.hibernate();
+  SPI.end();
   Serial.println("E-Ink refresh complete");
   return true;
 }
 
-bool refreshScreen()
+bool refreshScreen(uint32_t& refreshSeconds)
 {
   if (!connectWiFi())
   {
     return false;
   }
 
-  String screenshotUrl;
-  fetchDeviceConfig(screenshotUrl);
-  if (screenshotUrl.isEmpty() || !downloadScreenshot(screenshotUrl, downloadBuffer))
+  if (DEVICE_BASE_URL[0] == '\0')
+  {
+    Serial.println("DEVICE_BASE_URL is empty; copy it from E-Ink Control Desk");
+    return false;
+  }
+
+  const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png";
+  String responseEtag;
+  const DownloadResult result = downloadScreenshot(
+      screenshotUrl, downloadBuffer, responseEtag, refreshSeconds);
+  // The E-Ink refresh takes about 25 seconds and does not need the radio.
+  stopWiFi();
+  if (result == DownloadResult::failed)
   {
     return false;
   }
-  return showPng(downloadBuffer);
+  if (result == DownloadResult::notModified)
+  {
+    return true;
+  }
+
+  const uint32_t imageHash = fnv1a(downloadBuffer);
+  if (hasLastImageHash && imageHash == lastImageHash)
+  {
+    Serial.println("Downloaded PNG is identical; skipping E-Ink refresh");
+    rememberEtag(responseEtag);
+    return true;
+  }
+  if (!showPng(downloadBuffer))
+  {
+    return false;
+  }
+
+  lastImageHash = imageHash;
+  hasLastImageHash = true;
+  rememberEtag(responseEtag);
+  return true;
+}
+
+[[noreturn]] void sleepFor(uint32_t seconds)
+{
+  stopWiFi();
+  Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
+  esp_deep_sleep_start();
+  while (true) {}
 }
 
 void setup()
@@ -361,18 +412,11 @@ void setup()
   Serial.printf("PNG buffer reserved: %u bytes\n",
                 static_cast<unsigned>(downloadBuffer.capacity()));
 
-  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
-
-  const bool refreshed = refreshScreen();
-  nextRefreshAt = millis() + (refreshed ? refreshIntervalMs : RETRY_INTERVAL_MS);
+  uint32_t refreshSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+  const bool refreshed = refreshScreen(refreshSeconds);
+  sleepFor(refreshed ? refreshSeconds : RETRY_INTERVAL_SECONDS);
 }
 
 void loop()
 {
-  if (static_cast<int32_t>(millis() - nextRefreshAt) >= 0)
-  {
-    const bool refreshed = refreshScreen();
-    nextRefreshAt = millis() + (refreshed ? refreshIntervalMs : RETRY_INTERVAL_MS);
-  }
-  delay(250);
 }
