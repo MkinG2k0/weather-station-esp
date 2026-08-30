@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 
 #include <GxEPD2_3C.h>
 
@@ -32,8 +33,8 @@ constexpr int EPD_BUSY = 14;
 constexpr int ENV_SENSOR_POWER = 12; // D13
 constexpr int ENV_SENSOR_SCL = 16;   // D11
 constexpr int ENV_SENSOR_SDA = 17;   // D10
-constexpr uint32_t ENV_SENSOR_I2C_FREQUENCY = 100000;
-constexpr uint16_t ENV_SENSOR_I2C_TIMEOUT_MS = 50;
+constexpr uint32_t ENV_SENSOR_I2C_FREQUENCY = 50000;
+constexpr uint16_t ENV_SENSOR_I2C_TIMEOUT_MS = 200;
 constexpr uint8_t ENV_SENSOR_ADDRESS_LOW = 0x76;
 constexpr uint8_t ENV_SENSOR_ADDRESS_HIGH = 0x77;
 constexpr uint8_t BME280_CHIP_ID = 0x60;
@@ -55,8 +56,9 @@ GxEPD2_3C<GxEPD2_750c_86BF, 80> display(
     GxEPD2_750c_86BF(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 PNG* activePng = nullptr;
 PNG pngDecoder;
+TwoWire envI2c(1);
 Adafruit_BME280 bme280;
-Adafruit_BMP280 bmp280(&Wire);
+Adafruit_BMP280 bmp280(&envI2c);
 uint16_t rgbLine[IMAGE_WIDTH];
 std::vector<uint8_t> downloadBuffer;
 
@@ -86,73 +88,213 @@ EnvironmentReading latestEnvironment;
 
 void powerOffEnvironmentSensor()
 {
-  Wire.end();
+  envI2c.end();
   pinMode(ENV_SENSOR_SDA, INPUT);
   pinMode(ENV_SENSOR_SCL, INPUT);
   digitalWrite(ENV_SENSOR_POWER, LOW);
   pinMode(ENV_SENSOR_POWER, OUTPUT);
 }
 
-bool i2cDeviceResponds(uint8_t address)
+void powerOnEnvironmentSensor()
 {
-  Wire.beginTransmission(address);
-  return Wire.endTransmission() == 0;
+  const gpio_num_t powerPin = static_cast<gpio_num_t>(ENV_SENSOR_POWER);
+  pinMode(ENV_SENSOR_POWER, OUTPUT);
+  digitalWrite(ENV_SENSOR_POWER, HIGH);
+  gpio_set_drive_capability(powerPin, GPIO_DRIVE_CAP_3);
+  if (rtc_gpio_is_valid_gpio(powerPin))
+  {
+    rtc_gpio_hold_dis(powerPin);
+  }
+}
+
+void recoverI2cBus()
+{
+  envI2c.end();
+  pinMode(ENV_SENSOR_SDA, INPUT_PULLUP);
+  pinMode(ENV_SENSOR_SCL, OUTPUT);
+  for (int pulse = 0; pulse < 16; ++pulse)
+  {
+    digitalWrite(ENV_SENSOR_SCL, HIGH);
+    delayMicroseconds(10);
+    if (digitalRead(ENV_SENSOR_SDA) != LOW)
+    {
+      break;
+    }
+    digitalWrite(ENV_SENSOR_SCL, LOW);
+    delayMicroseconds(10);
+  }
+  pinMode(ENV_SENSOR_SDA, OUTPUT);
+  digitalWrite(ENV_SENSOR_SDA, LOW);
+  digitalWrite(ENV_SENSOR_SCL, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ENV_SENSOR_SDA, HIGH);
+  delayMicroseconds(10);
+  pinMode(ENV_SENSOR_SDA, INPUT_PULLUP);
+  pinMode(ENV_SENSOR_SCL, INPUT_PULLUP);
+}
+
+void logSensorPins(const char* when)
+{
+  Serial.printf("Sensor pins %s: PWR=%d SDA=%d SCL=%d\n", when,
+                digitalRead(ENV_SENSOR_POWER), digitalRead(ENV_SENSOR_SDA),
+                digitalRead(ENV_SENSOR_SCL));
+}
+
+bool startEnvI2c(int sda, int scl)
+{
+  envI2c.end();
+  envI2c.setPins(sda, scl);
+  if (!envI2c.begin(sda, scl, ENV_SENSOR_I2C_FREQUENCY))
+  {
+    return false;
+  }
+  envI2c.setTimeOut(ENV_SENSOR_I2C_TIMEOUT_MS);
+  envI2c.setClock(ENV_SENSOR_I2C_FREQUENCY);
+  gpio_pullup_en(static_cast<gpio_num_t>(sda));
+  gpio_pullup_en(static_cast<gpio_num_t>(scl));
+  return true;
+}
+
+uint8_t probeI2cAddress(uint8_t address)
+{
+  envI2c.beginTransmission(address);
+  return envI2c.endTransmission();
+}
+
+uint8_t scanI2cBus(uint8_t* found, uint8_t maxFound)
+{
+  uint8_t count = 0;
+  Serial.print("I2C scan:");
+  for (uint8_t address = 0x08; address < 0x78; ++address)
+  {
+    if (probeI2cAddress(address) != 0)
+    {
+      continue;
+    }
+    Serial.printf(" 0x%02X", address);
+    if (count < maxFound)
+    {
+      found[count] = address;
+    }
+    ++count;
+  }
+  if (count == 0)
+  {
+    Serial.print(" none");
+  }
+  Serial.println();
+  return count;
 }
 
 uint8_t readBmpChipId(uint8_t address)
 {
-  Wire.beginTransmission(address);
-  Wire.write(0xD0);
-  if (Wire.endTransmission() != 0)
+  envI2c.beginTransmission(address);
+  envI2c.write(0xD0);
+  if (envI2c.endTransmission() != 0)
   {
     return 0;
   }
-  if (Wire.requestFrom(static_cast<int>(address), 1) != 1)
+  if (envI2c.requestFrom(static_cast<int>(address), 1) != 1)
   {
     return 0;
   }
-  return static_cast<uint8_t>(Wire.read());
+  return static_cast<uint8_t>(envI2c.read());
+}
+
+void logSensorReading()
+{
+  if (!latestEnvironment.available)
+  {
+    Serial.println("Sensor data: none (card on server will show no device data)");
+    return;
+  }
+  Serial.printf("Sensor data: chip=%s temp_c=%.2f pressure_hpa=%.2f altitude_m=%.1f",
+                latestEnvironment.hasHumidity ? "bme280" : "bmp280",
+                latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
+                latestEnvironment.altitudeM);
+  if (latestEnvironment.hasHumidity)
+  {
+    Serial.printf(" humidity=%.1f", latestEnvironment.humidityPercent);
+  }
+  Serial.println();
 }
 
 void readOptionalEnvironmentSensor()
 {
   latestEnvironment = EnvironmentReading{};
 
-  digitalWrite(ENV_SENSOR_POWER, LOW);
-  pinMode(ENV_SENSOR_POWER, OUTPUT);
-  digitalWrite(ENV_SENSOR_POWER, HIGH);
-  gpio_set_drive_capability(static_cast<gpio_num_t>(ENV_SENSOR_POWER), GPIO_DRIVE_CAP_3);
-  delay(50);
+  Serial.printf("Sensor bus: SDA=GPIO %d, SCL=GPIO %d, PWR=GPIO %d\n",
+                ENV_SENSOR_SDA, ENV_SENSOR_SCL, ENV_SENSOR_POWER);
 
+  powerOnEnvironmentSensor();
+  delay(250);
   pinMode(ENV_SENSOR_SDA, INPUT_PULLUP);
   pinMode(ENV_SENSOR_SCL, INPUT_PULLUP);
-  if (!Wire.begin(ENV_SENSOR_SDA, ENV_SENSOR_SCL, ENV_SENSOR_I2C_FREQUENCY))
+  logSensorPins("after power-on");
+  if (digitalRead(ENV_SENSOR_SDA) == LOW || digitalRead(ENV_SENSOR_SCL) == LOW)
+  {
+    recoverI2cBus();
+    logSensorPins("after bus recover");
+  }
+  if (digitalRead(ENV_SENSOR_POWER) == LOW || digitalRead(ENV_SENSOR_SDA) == LOW ||
+      digitalRead(ENV_SENSOR_SCL) == LOW)
+  {
+    Serial.println("I2C lines are held low; BMP VIN is probably not getting 3.3V from GPIO 12");
+    Serial.println("Try wiring BMP VIN to FireBeetle 3V3 instead of D13, then reset");
+  }
+
+  int sda = ENV_SENSOR_SDA;
+  int scl = ENV_SENSOR_SCL;
+  if (!startEnvI2c(sda, scl))
   {
     Serial.println("Optional sensor: I2C initialization failed; continuing without sensor");
+    logSensorReading();
     powerOffEnvironmentSensor();
     return;
   }
-  Wire.setTimeOut(ENV_SENSOR_I2C_TIMEOUT_MS);
+
+  uint8_t found[4] = {};
+  uint8_t foundCount = scanI2cBus(found, 4);
+  if (foundCount == 0)
+  {
+    Serial.println("Retrying I2C with SDA/SCL swapped");
+    sda = ENV_SENSOR_SCL;
+    scl = ENV_SENSOR_SDA;
+    if (!startEnvI2c(sda, scl))
+    {
+      Serial.println("Optional sensor: I2C initialization failed; continuing without sensor");
+      logSensorReading();
+      powerOffEnvironmentSensor();
+      return;
+    }
+    foundCount = scanI2cBus(found, 4);
+  }
 
   uint8_t address = 0;
-  if (i2cDeviceResponds(ENV_SENSOR_ADDRESS_LOW))
+  for (uint8_t i = 0; i < foundCount && i < 4; ++i)
   {
-    address = ENV_SENSOR_ADDRESS_LOW;
+    if (found[i] == ENV_SENSOR_ADDRESS_LOW || found[i] == ENV_SENSOR_ADDRESS_HIGH)
+    {
+      address = found[i];
+      break;
+    }
   }
-  else if (i2cDeviceResponds(ENV_SENSOR_ADDRESS_HIGH))
+  if (address == 0 && foundCount > 0)
   {
-    address = ENV_SENSOR_ADDRESS_HIGH;
+    address = found[0];
   }
 
   if (address == 0)
   {
-    Serial.println("Optional BME/BMP280 not detected; continuing without sensor");
+    Serial.println("No I2C device on D10/D11. Leave SDA and SCL connected to the sensor and reset");
+    logSensorReading();
     powerOffEnvironmentSensor();
     return;
   }
 
   const uint8_t chipId = readBmpChipId(address);
-  if (chipId == BME280_CHIP_ID && bme280.begin(address, &Wire))
+  Serial.printf("Sensor ACK at 0x%02X, chip id 0x%02X\n", address, chipId);
+  if (chipId == BME280_CHIP_ID && bme280.begin(address, &envI2c))
   {
     bme280.setSampling(Adafruit_BME280::MODE_FORCED, Adafruit_BME280::SAMPLING_X1,
                        Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::SAMPLING_X1,
@@ -164,9 +306,6 @@ void readOptionalEnvironmentSensor()
     latestEnvironment.pressureHpa = bme280.readPressure() / 100.0f;
     latestEnvironment.humidityPercent = bme280.readHumidity();
     latestEnvironment.altitudeM = bme280.readAltitude(1013.25f);
-    Serial.printf("BME280 at 0x%02X: %.1f C, %.1f hPa, %.1f %%RH, %.0f m\n", address,
-                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
-                  latestEnvironment.humidityPercent, latestEnvironment.altitudeM);
   }
   else if ((chipId == BMP280_CHIP_ID || chipId == 0) && bmp280.begin(address))
   {
@@ -178,9 +317,6 @@ void readOptionalEnvironmentSensor()
     latestEnvironment.temperatureC = bmp280.readTemperature();
     latestEnvironment.pressureHpa = bmp280.readPressure() / 100.0f;
     latestEnvironment.altitudeM = bmp280.readAltitude(1013.25f);
-    Serial.printf("BMP280 at 0x%02X: %.1f C, %.1f hPa, %.0f m\n", address,
-                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
-                  latestEnvironment.altitudeM);
   }
   else
   {
@@ -188,6 +324,7 @@ void readOptionalEnvironmentSensor()
                   address, chipId);
   }
 
+  logSensorReading();
   powerOffEnvironmentSensor();
 }
 
@@ -334,7 +471,8 @@ bool connectWiFi()
 
   Serial.printf("Connecting to Wi-Fi %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);
+  // Modem sleep drops TLS handshake packets and shows up as start_ssl_client: -1.
+  WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);
   lastWiFiDisconnectReason = 0;
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -359,6 +497,9 @@ bool connectWiFi()
 
   Serial.print("Wi-Fi connected, IP: ");
   Serial.println(WiFi.localIP());
+  Serial.printf("Free heap before HTTPS: %u bytes\n",
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  delay(250);
   return true;
 }
 
@@ -405,26 +546,46 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
 {
   WiFiClientSecure client;
   client.setInsecure(); // Test firmware: accept Vercel's current TLS certificate chain.
+  client.setHandshakeTimeout(30);
 
   HTTPClient http;
-  http.setConnectTimeout(15000);
+  http.setConnectTimeout(25000);
   http.setTimeout(DOWNLOAD_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   const char* responseHeaders[] = {"Content-Type", "ETag", "X-Next-Refresh-Seconds"};
   http.collectHeaders(responseHeaders, 3);
 
   Serial.printf("GET %s\n", screenshotUrl.c_str());
-  if (!http.begin(client, screenshotUrl))
+  int status = -1;
+  for (int attempt = 1; attempt <= 3; ++attempt)
   {
-    showError("Invalid or unsupported link", screenshotUrl);
+    if (!http.begin(client, screenshotUrl))
+    {
+      showError("Invalid or unsupported link", screenshotUrl);
+      return DownloadResult::failed;
+    }
+    if (lastScreenEtag[0] != '\0')
+    {
+      http.addHeader("If-None-Match", lastScreenEtag);
+    }
+
+    status = http.GET();
+    if (status > 0)
+    {
+      break;
+    }
+    Serial.printf("HTTPS attempt %d failed: %d (%s), heap %u\n", attempt, status,
+                  http.errorToString(status).c_str(),
+                  static_cast<unsigned>(ESP.getFreeHeap()));
+    http.end();
+    delay(750 * attempt);
+  }
+  if (status <= 0)
+  {
+    String details = "HTTP status: " + String(status) + " (" + http.errorToString(status) + ")";
+    showError("Server connection failed", details);
     return DownloadResult::failed;
   }
-  if (lastScreenEtag[0] != '\0')
-  {
-    http.addHeader("If-None-Match", lastScreenEtag);
-  }
-
-  const int status = http.GET();
   applyRefreshHeader(http.header("X-Next-Refresh-Seconds"), refreshSeconds);
   if (status == HTTP_CODE_NOT_MODIFIED)
   {
@@ -631,6 +792,7 @@ bool refreshScreen(uint32_t& refreshSeconds)
   }
 
   const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png" + screenshotQuery();
+  logSensorReading();
   String responseEtag;
   const DownloadResult result = downloadScreenshot(
       screenshotUrl, downloadBuffer, responseEtag, refreshSeconds);
