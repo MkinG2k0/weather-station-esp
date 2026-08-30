@@ -718,7 +718,7 @@ int drawPngLine(PNGDRAW* draw)
     const uint16_t green = (pixel >> 5) & 0x3f;
     const uint16_t blue = pixel & 0x1f;
     const uint16_t luminance = red * 299U + green * 293U + blue * 114U;
-    const uint16_t color = luminance < 24000U ? GxEPD_BLACK : GxEPD_WHITE;
+    const uint16_t color = luminance < 15800U ? GxEPD_BLACK : GxEPD_WHITE;
     display.drawPixel(x, draw->y, color);
   }
   return 1;
