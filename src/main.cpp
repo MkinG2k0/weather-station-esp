@@ -2,12 +2,15 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_BMP280.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <PNGdec.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <cmath>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -40,6 +43,15 @@ constexpr uint8_t ENV_SENSOR_ADDRESS_HIGH = 0x77;
 constexpr uint8_t BME280_CHIP_ID = 0x60;
 constexpr uint8_t BMP280_CHIP_ID = 0x58;
 
+// FireBeetle 2 ESP32-E (DFR0654): battery sense is A0 / GPIO36 through a 1:1
+// divider, so pack voltage is twice the ADC millivolts. No pack → leave the
+// query parameter off, same as a missing BMP/BME sensor.
+constexpr int BATTERY_ADC_PIN = 36;
+constexpr uint32_t BATTERY_DIVIDER = 2;
+constexpr uint32_t BATTERY_SAMPLE_COUNT = 8;
+constexpr float BATTERY_PRESENT_MIN_V = 3.05f;
+constexpr float BATTERY_PRESENT_MAX_V = 4.40f;
+
 constexpr uint32_t WIFI_TIMEOUT_MS = 30000;
 constexpr uint32_t DOWNLOAD_TIMEOUT_MS = 30000;
 constexpr uint32_t DEFAULT_REFRESH_INTERVAL_SECONDS = 10UL * 60UL;
@@ -49,6 +61,10 @@ constexpr uint32_t MAX_REFRESH_INTERVAL_SECONDS = 24UL * 60UL * 60UL;
 constexpr size_t MAX_PNG_SIZE = 64UL * 1024UL;
 constexpr int IMAGE_WIDTH = 800;
 constexpr int IMAGE_HEIGHT = 480;
+constexpr uint16_t TEMP_LOG_MAX_POINTS = 1440;
+constexpr uint32_t TEMP_LOG_MAX_AGE_SEC = 31UL * 24UL * 3600UL;
+constexpr uint16_t TEMP_LOG_SEND_POINTS = 180;
+constexpr uint32_t NTP_MIN_UNIX = 1600000000UL;
 
 // 80 display rows per page keep the PNG decoder in static memory and avoid
 // heap fragmentation. The complete 800x480 image is rendered in 6 passes.
@@ -85,6 +101,141 @@ struct EnvironmentReading
 };
 
 EnvironmentReading latestEnvironment;
+
+struct BatteryReading
+{
+  bool available = false;
+  float voltage = 0.0f;
+  int percent = 0;
+};
+
+BatteryReading latestBattery;
+
+struct TempSample
+{
+  uint32_t unix;
+  int16_t tenth;
+} __attribute__((packed));
+
+TempSample tempLog[TEMP_LOG_MAX_POINTS];
+uint16_t tempLogCount = 0;
+
+void loadTemperatureLog()
+{
+  tempLogCount = 0;
+  Preferences prefs;
+  if (!prefs.begin("templog", true))
+  {
+    return;
+  }
+  const size_t length = prefs.getBytesLength("blob");
+  if (length >= sizeof(TempSample) && length <= sizeof(tempLog) && (length % sizeof(TempSample)) == 0)
+  {
+    prefs.getBytes("blob", tempLog, length);
+    tempLogCount = static_cast<uint16_t>(length / sizeof(TempSample));
+  }
+  prefs.end();
+}
+
+void saveTemperatureLog()
+{
+  Preferences prefs;
+  if (!prefs.begin("templog", false))
+  {
+    return;
+  }
+  prefs.putBytes("blob", tempLog, tempLogCount * sizeof(TempSample));
+  prefs.end();
+}
+
+void pruneTemperatureLog(uint32_t nowUnix)
+{
+  uint16_t write = 0;
+  for (uint16_t read = 0; read < tempLogCount; ++read)
+  {
+    if (nowUnix >= tempLog[read].unix && nowUnix - tempLog[read].unix <= TEMP_LOG_MAX_AGE_SEC)
+    {
+      tempLog[write++] = tempLog[read];
+    }
+  }
+  tempLogCount = write;
+  if (tempLogCount > TEMP_LOG_MAX_POINTS)
+  {
+    const uint16_t drop = tempLogCount - TEMP_LOG_MAX_POINTS;
+    memmove(tempLog, tempLog + drop, TEMP_LOG_MAX_POINTS * sizeof(TempSample));
+    tempLogCount = TEMP_LOG_MAX_POINTS;
+  }
+}
+
+void appendTemperatureSample(uint32_t nowUnix, float temperatureC)
+{
+  loadTemperatureLog();
+  pruneTemperatureLog(nowUnix);
+  const int16_t tenth = static_cast<int16_t>(lroundf(temperatureC * 10.0f));
+  if (tempLogCount > 0 && tempLog[tempLogCount - 1].unix / 60 == nowUnix / 60)
+  {
+    tempLog[tempLogCount - 1].tenth = tenth;
+    tempLog[tempLogCount - 1].unix = nowUnix;
+  }
+  else if (tempLogCount < TEMP_LOG_MAX_POINTS)
+  {
+    tempLog[tempLogCount++] = TempSample{nowUnix, tenth};
+  }
+  else
+  {
+    memmove(tempLog, tempLog + 1, (TEMP_LOG_MAX_POINTS - 1) * sizeof(TempSample));
+    tempLog[TEMP_LOG_MAX_POINTS - 1] = TempSample{nowUnix, tenth};
+  }
+  saveTemperatureLog();
+}
+
+String encodeTemperatureHist()
+{
+  if (tempLogCount == 0)
+  {
+    loadTemperatureLog();
+  }
+  if (tempLogCount == 0)
+  {
+    return "";
+  }
+  const uint16_t start = tempLogCount > TEMP_LOG_SEND_POINTS ? tempLogCount - TEMP_LOG_SEND_POINTS : 0;
+  String encoded;
+  encoded.reserve((tempLogCount - start) * 10);
+  encoded += String(tempLog[start].unix);
+  encoded += ',';
+  encoded += String(tempLog[start].tenth);
+  for (uint16_t index = start + 1; index < tempLogCount; ++index)
+  {
+    int32_t minutes = static_cast<int32_t>(tempLog[index].unix - tempLog[index - 1].unix) / 60;
+    if (minutes < 0)
+    {
+      minutes = 0;
+    }
+    encoded += ',';
+    encoded += String(minutes);
+    encoded += ',';
+    encoded += String(tempLog[index].tenth);
+  }
+  return encoded;
+}
+
+bool syncNetworkTime()
+{
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  for (int attempt = 0; attempt < 50; ++attempt)
+  {
+    const time_t now = time(nullptr);
+    if (now > static_cast<time_t>(NTP_MIN_UNIX))
+    {
+      Serial.printf("NTP unix %ld\n", static_cast<long>(now));
+      return true;
+    }
+    delay(200);
+  }
+  Serial.println("NTP failed");
+  return false;
+}
 
 void powerOffEnvironmentSensor()
 {
@@ -217,6 +368,64 @@ void logSensorReading()
     Serial.printf(" humidity=%.1f", latestEnvironment.humidityPercent);
   }
   Serial.println();
+}
+
+int lipoPercentFromVoltage(float volts)
+{
+  static const float table[][2] = {
+      {4.20f, 100.0f}, {4.15f, 95.0f}, {4.11f, 90.0f}, {4.08f, 85.0f},
+      {4.02f, 80.0f},  {3.98f, 75.0f}, {3.95f, 70.0f}, {3.91f, 65.0f},
+      {3.87f, 60.0f},  {3.85f, 55.0f}, {3.84f, 50.0f}, {3.82f, 45.0f},
+      {3.80f, 40.0f},  {3.79f, 35.0f}, {3.77f, 30.0f}, {3.75f, 25.0f},
+      {3.73f, 20.0f},  {3.71f, 15.0f}, {3.69f, 10.0f}, {3.61f, 5.0f},
+      {3.30f, 0.0f},
+  };
+  constexpr size_t count = sizeof(table) / sizeof(table[0]);
+  if (volts >= table[0][0])
+  {
+    return 100;
+  }
+  if (volts <= table[count - 1][0])
+  {
+    return 0;
+  }
+  for (size_t i = 0; i + 1 < count; ++i)
+  {
+    if (volts <= table[i][0] && volts >= table[i + 1][0])
+    {
+      const float span = table[i][0] - table[i + 1][0];
+      const float t = span > 0.0f ? (volts - table[i + 1][0]) / span : 0.0f;
+      return static_cast<int>(table[i + 1][1] + t * (table[i][1] - table[i + 1][1]) + 0.5f);
+    }
+  }
+  return 0;
+}
+
+void readOptionalBattery()
+{
+  latestBattery = BatteryReading{};
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  delay(8);
+
+  uint64_t milliSum = 0;
+  for (uint32_t sample = 0; sample < BATTERY_SAMPLE_COUNT; ++sample)
+  {
+    milliSum += analogReadMilliVolts(BATTERY_ADC_PIN);
+    delay(4);
+  }
+  const float pinVolts = (milliSum / static_cast<float>(BATTERY_SAMPLE_COUNT)) / 1000.0f;
+  const float packVolts = pinVolts * static_cast<float>(BATTERY_DIVIDER);
+
+  if (packVolts < BATTERY_PRESENT_MIN_V || packVolts > BATTERY_PRESENT_MAX_V)
+  {
+    Serial.printf("Battery: not present (%.2f V on pack sense)\n", packVolts);
+    return;
+  }
+
+  latestBattery.available = true;
+  latestBattery.voltage = packVolts;
+  latestBattery.percent = lipoPercentFromVoltage(packVolts);
+  Serial.printf("Battery: %.2f V -> %d%%\n", latestBattery.voltage, latestBattery.percent);
 }
 
 void readOptionalEnvironmentSensor()
@@ -439,25 +648,36 @@ private:
   bool overflowed_ = false;
 };
 
+void appendQueryParam(String& query, const char* key, const String& value)
+{
+  query += query.length() == 0 ? '?' : '&';
+  query += key;
+  query += '=';
+  query += value;
+}
+
 String screenshotQuery()
 {
-  if (!latestEnvironment.available)
+  String query;
+  if (latestEnvironment.available)
   {
-    return "";
+    appendQueryParam(query, "chip", latestEnvironment.hasHumidity ? "bme280" : "bmp280");
+    appendQueryParam(query, "temp_c", String(latestEnvironment.temperatureC, 2));
+    appendQueryParam(query, "pressure_hpa", String(latestEnvironment.pressureHpa, 2));
+    appendQueryParam(query, "altitude_m", String(latestEnvironment.altitudeM, 1));
+    if (latestEnvironment.hasHumidity)
+    {
+      appendQueryParam(query, "humidity", String(latestEnvironment.humidityPercent, 1));
+    }
   }
-
-  String query = "?chip=";
-  query += latestEnvironment.hasHumidity ? "bme280" : "bmp280";
-  query += "&temp_c=";
-  query += String(latestEnvironment.temperatureC, 2);
-  query += "&pressure_hpa=";
-  query += String(latestEnvironment.pressureHpa, 2);
-  query += "&altitude_m=";
-  query += String(latestEnvironment.altitudeM, 1);
-  if (latestEnvironment.hasHumidity)
+  if (latestBattery.available)
   {
-    query += "&humidity=";
-    query += String(latestEnvironment.humidityPercent, 1);
+    appendQueryParam(query, "batt_pct", String(latestBattery.percent));
+  }
+  const String hist = encodeTemperatureHist();
+  if (hist.length() > 0)
+  {
+    appendQueryParam(query, "hist", hist);
   }
   return query;
 }
@@ -791,6 +1011,12 @@ bool refreshScreen(uint32_t& refreshSeconds)
     return false;
   }
 
+  loadTemperatureLog();
+  if (syncNetworkTime() && latestEnvironment.available)
+  {
+    appendTemperatureSample(static_cast<uint32_t>(time(nullptr)), latestEnvironment.temperatureC);
+  }
+
   const String screenshotUrl = String(DEVICE_BASE_URL) + "/screen.png" + screenshotQuery();
   logSensorReading();
   String responseEtag;
@@ -842,10 +1068,10 @@ void setup()
   Serial.println("FPC-8612 Wi-Fi weather display: start");
   WiFi.onEvent(recordWiFiDisconnectReason, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  // The sensor, reset button and battery are optional. A reset button wired
-  // between RESET and GND works in hardware; the JST battery input is managed
-  // by the FireBeetle power circuit. Only the sensor needs firmware support.
+  // Sensor, reset button and battery are optional. Reset is hardware-only;
+  // charging is onboard. Firmware only reads the sensor and battery ADC.
   readOptionalEnvironmentSensor();
+  readOptionalBattery();
 
   // Allocate the download buffer before Wi-Fi/TLS can fragment the heap.
   downloadBuffer.reserve(MAX_PNG_SIZE);
