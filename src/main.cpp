@@ -61,9 +61,12 @@ constexpr uint32_t MAX_REFRESH_INTERVAL_SECONDS = 24UL * 60UL * 60UL;
 constexpr size_t MAX_PNG_SIZE = 64UL * 1024UL;
 constexpr int IMAGE_WIDTH = 800;
 constexpr int IMAGE_HEIGHT = 480;
-constexpr uint16_t TEMP_LOG_MAX_POINTS = 1440;
-constexpr uint32_t TEMP_LOG_MAX_AGE_SEC = 31UL * 24UL * 3600UL;
-constexpr uint16_t TEMP_LOG_SEND_POINTS = 180;
+// Long history lives on the server. Keep a small catch-up buffer in DRAM/NVS
+// so a missed screen.png still uploads recent BMP samples without overflowing
+// ESP32 RAM (~8.6 KB for 1440 packed points).
+constexpr uint16_t TEMP_LOG_MAX_POINTS = 48;
+constexpr uint32_t TEMP_LOG_MAX_AGE_SEC = 2UL * 24UL * 3600UL;
+constexpr uint16_t TEMP_LOG_SEND_POINTS = 48;
 constexpr uint32_t NTP_MIN_UNIX = 1600000000UL;
 
 // 80 display rows per page keep the PNG decoder in static memory and avoid
@@ -129,7 +132,8 @@ void loadTemperatureLog()
     return;
   }
   const size_t length = prefs.getBytesLength("blob");
-  if (length >= sizeof(TempSample) && length <= sizeof(tempLog) && (length % sizeof(TempSample)) == 0)
+  if (length >= sizeof(TempSample) && (length % sizeof(TempSample)) == 0 &&
+      length <= sizeof(tempLog))
   {
     prefs.getBytes("blob", tempLog, length);
     tempLogCount = static_cast<uint16_t>(length / sizeof(TempSample));
@@ -159,12 +163,6 @@ void pruneTemperatureLog(uint32_t nowUnix)
     }
   }
   tempLogCount = write;
-  if (tempLogCount > TEMP_LOG_MAX_POINTS)
-  {
-    const uint16_t drop = tempLogCount - TEMP_LOG_MAX_POINTS;
-    memmove(tempLog, tempLog + drop, TEMP_LOG_MAX_POINTS * sizeof(TempSample));
-    tempLogCount = TEMP_LOG_MAX_POINTS;
-  }
 }
 
 void appendTemperatureSample(uint32_t nowUnix, float temperatureC)
