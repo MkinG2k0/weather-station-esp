@@ -1,11 +1,16 @@
 #include <Arduino.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_BMP280.h>
 #include <HTTPClient.h>
 #include <PNGdec.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <cstring>
 #include <vector>
+
+#include "driver/gpio.h"
 
 #include <GxEPD2_3C.h>
 
@@ -21,6 +26,18 @@ constexpr int EPD_CS = 13;
 constexpr int EPD_DC = 22;
 constexpr int EPD_RST = 21;
 constexpr int EPD_BUSY = 14;
+
+// Optional BME280/BMP280 from the wiring diagram. GPIO 12 (D13) switches the
+// sensor power so the module does not consume energy while the ESP32 is sleeping.
+constexpr int ENV_SENSOR_POWER = 12; // D13
+constexpr int ENV_SENSOR_SCL = 16;   // D11
+constexpr int ENV_SENSOR_SDA = 17;   // D10
+constexpr uint32_t ENV_SENSOR_I2C_FREQUENCY = 100000;
+constexpr uint16_t ENV_SENSOR_I2C_TIMEOUT_MS = 50;
+constexpr uint8_t ENV_SENSOR_ADDRESS_LOW = 0x76;
+constexpr uint8_t ENV_SENSOR_ADDRESS_HIGH = 0x77;
+constexpr uint8_t BME280_CHIP_ID = 0x60;
+constexpr uint8_t BMP280_CHIP_ID = 0x58;
 
 constexpr uint32_t WIFI_TIMEOUT_MS = 30000;
 constexpr uint32_t DOWNLOAD_TIMEOUT_MS = 30000;
@@ -38,12 +55,15 @@ GxEPD2_3C<GxEPD2_750c_86BF, 80> display(
     GxEPD2_750c_86BF(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 PNG* activePng = nullptr;
 PNG pngDecoder;
+Adafruit_BME280 bme280;
+Adafruit_BMP280 bmp280(&Wire);
 uint16_t rgbLine[IMAGE_WIDTH];
 std::vector<uint8_t> downloadBuffer;
 
 RTC_DATA_ATTR char lastScreenEtag[72] = "";
 RTC_DATA_ATTR uint32_t lastImageHash = 0;
 RTC_DATA_ATTR bool hasLastImageHash = false;
+volatile uint8_t lastWiFiDisconnectReason = 0;
 
 enum class DownloadResult
 {
@@ -51,6 +71,204 @@ enum class DownloadResult
   notModified,
   failed,
 };
+
+struct EnvironmentReading
+{
+  bool available = false;
+  bool hasHumidity = false;
+  float temperatureC = 0.0f;
+  float pressureHpa = 0.0f;
+  float humidityPercent = 0.0f;
+};
+
+EnvironmentReading latestEnvironment;
+
+void powerOffEnvironmentSensor()
+{
+  Wire.end();
+  pinMode(ENV_SENSOR_SDA, INPUT);
+  pinMode(ENV_SENSOR_SCL, INPUT);
+  digitalWrite(ENV_SENSOR_POWER, LOW);
+  pinMode(ENV_SENSOR_POWER, OUTPUT);
+}
+
+bool i2cDeviceResponds(uint8_t address)
+{
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+uint8_t readBmpChipId(uint8_t address)
+{
+  Wire.beginTransmission(address);
+  Wire.write(0xD0);
+  if (Wire.endTransmission() != 0)
+  {
+    return 0;
+  }
+  if (Wire.requestFrom(static_cast<int>(address), 1) != 1)
+  {
+    return 0;
+  }
+  return static_cast<uint8_t>(Wire.read());
+}
+
+void readOptionalEnvironmentSensor()
+{
+  latestEnvironment = EnvironmentReading{};
+
+  digitalWrite(ENV_SENSOR_POWER, LOW);
+  pinMode(ENV_SENSOR_POWER, OUTPUT);
+  digitalWrite(ENV_SENSOR_POWER, HIGH);
+  gpio_set_drive_capability(static_cast<gpio_num_t>(ENV_SENSOR_POWER), GPIO_DRIVE_CAP_3);
+  delay(50);
+
+  pinMode(ENV_SENSOR_SDA, INPUT_PULLUP);
+  pinMode(ENV_SENSOR_SCL, INPUT_PULLUP);
+  if (!Wire.begin(ENV_SENSOR_SDA, ENV_SENSOR_SCL, ENV_SENSOR_I2C_FREQUENCY))
+  {
+    Serial.println("Optional sensor: I2C initialization failed; continuing without sensor");
+    powerOffEnvironmentSensor();
+    return;
+  }
+  Wire.setTimeOut(ENV_SENSOR_I2C_TIMEOUT_MS);
+
+  uint8_t address = 0;
+  if (i2cDeviceResponds(ENV_SENSOR_ADDRESS_LOW))
+  {
+    address = ENV_SENSOR_ADDRESS_LOW;
+  }
+  else if (i2cDeviceResponds(ENV_SENSOR_ADDRESS_HIGH))
+  {
+    address = ENV_SENSOR_ADDRESS_HIGH;
+  }
+
+  if (address == 0)
+  {
+    Serial.println("Optional BME/BMP280 not detected; continuing without sensor");
+    powerOffEnvironmentSensor();
+    return;
+  }
+
+  const uint8_t chipId = readBmpChipId(address);
+  if (chipId == BME280_CHIP_ID && bme280.begin(address, &Wire))
+  {
+    bme280.setSampling(Adafruit_BME280::MODE_FORCED, Adafruit_BME280::SAMPLING_X1,
+                       Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::SAMPLING_X1,
+                       Adafruit_BME280::FILTER_OFF);
+    bme280.takeForcedMeasurement();
+    latestEnvironment.available = true;
+    latestEnvironment.hasHumidity = true;
+    latestEnvironment.temperatureC = bme280.readTemperature();
+    latestEnvironment.pressureHpa = bme280.readPressure() / 100.0f;
+    latestEnvironment.humidityPercent = bme280.readHumidity();
+    Serial.printf("BME280 at 0x%02X: %.1f C, %.1f hPa, %.1f %%RH\n", address,
+                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa,
+                  latestEnvironment.humidityPercent);
+  }
+  else if ((chipId == BMP280_CHIP_ID || chipId == 0) && bmp280.begin(address))
+  {
+    bmp280.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X1,
+                       Adafruit_BMP280::SAMPLING_X1, Adafruit_BMP280::FILTER_OFF,
+                       Adafruit_BMP280::STANDBY_MS_1);
+    bmp280.takeForcedMeasurement();
+    latestEnvironment.available = true;
+    latestEnvironment.temperatureC = bmp280.readTemperature();
+    latestEnvironment.pressureHpa = bmp280.readPressure() / 100.0f;
+    Serial.printf("BMP280 at 0x%02X: %.1f C, %.1f hPa\n", address,
+                  latestEnvironment.temperatureC, latestEnvironment.pressureHpa);
+  }
+  else
+  {
+    Serial.printf("I2C device at 0x%02X (chip id 0x%02X) is not a supported BME280/BMP280\n",
+                  address, chipId);
+  }
+
+  powerOffEnvironmentSensor();
+}
+
+void showError(const String& message, const String& details = "")
+{
+  Serial.printf("ERROR: %s", message.c_str());
+  if (!details.isEmpty())
+  {
+    Serial.printf(" - %s", details.c_str());
+  }
+  Serial.println();
+
+  // E-Ink keeps the last image without power, so leave a useful diagnostic on
+  // the device while it sleeps and retries.
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+  display.init(115200);
+  display.setRotation(0);
+  display.setFullWindow();
+  display.setTextColor(GxEPD_BLACK);
+  display.setTextWrap(true);
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextSize(4);
+    display.setCursor(32, 70);
+    display.println("ERROR");
+    display.drawFastHLine(32, 90, IMAGE_WIDTH - 64, GxEPD_BLACK);
+    display.setTextSize(3);
+    display.setCursor(32, 145);
+    display.println(message);
+    if (!details.isEmpty())
+    {
+      display.setTextSize(2);
+      display.setCursor(32, 245);
+      display.println(details);
+    }
+    display.setTextSize(2);
+    display.setCursor(32, 430);
+    display.println("The device will retry automatically.");
+  }
+  while (display.nextPage());
+  display.hibernate();
+  SPI.end();
+}
+
+void recordWiFiDisconnectReason(arduino_event_id_t event, arduino_event_info_t info)
+{
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+  {
+    lastWiFiDisconnectReason = info.wifi_sta_disconnected.reason;
+  }
+}
+
+String wiFiErrorMessage(wl_status_t status, uint8_t reason)
+{
+  switch (reason)
+  {
+    case WIFI_REASON_NO_AP_FOUND:
+      return "Wi-Fi network not found";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+      return "Wi-Fi authentication failed (wrong password)";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "Wi-Fi signal was lost";
+    default:
+      break;
+  }
+
+  switch (status)
+  {
+    case WL_NO_SSID_AVAIL:
+      return "Wi-Fi network not found";
+    case WL_CONNECT_FAILED:
+      return "Wi-Fi authentication failed (wrong password)";
+    case WL_CONNECTION_LOST:
+      return "Wi-Fi connection lost";
+    case WL_DISCONNECTED:
+      return "Wi-Fi disconnected or password is incorrect";
+    default:
+      return "Wi-Fi connection timed out";
+  }
+}
 
 class VectorWriteStream : public Stream
 {
@@ -91,6 +309,7 @@ bool connectWiFi()
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);
   WiFi.setAutoReconnect(false);
+  lastWiFiDisconnectReason = 0;
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   const uint32_t startedAt = millis();
@@ -103,7 +322,11 @@ bool connectWiFi()
 
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.printf("Wi-Fi connection failed, status=%d\n", WiFi.status());
+    const wl_status_t status = WiFi.status();
+    const uint8_t reason = lastWiFiDisconnectReason;
+    const String details = "Status: " + String(static_cast<int>(status)) +
+                           ", disconnect reason: " + String(reason);
+    showError(wiFiErrorMessage(status, reason), details);
     return false;
   }
 
@@ -166,7 +389,7 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
   Serial.printf("GET %s\n", screenshotUrl.c_str());
   if (!http.begin(client, screenshotUrl))
   {
-    Serial.println("HTTPS initialization failed");
+    showError("Invalid or unsupported link", screenshotUrl);
     return DownloadResult::failed;
   }
   if (lastScreenEtag[0] != '\0')
@@ -185,8 +408,26 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
   }
   if (status != HTTP_CODE_OK)
   {
-    Serial.printf("HTTP error: %d (%s)\n", status, http.errorToString(status).c_str());
+    String message;
+    if (status == HTTP_CODE_NOT_FOUND)
+    {
+      message = "Link not found";
+    }
+    else if (status < 0)
+    {
+      message = "Server connection failed";
+    }
+    else
+    {
+      message = "Server returned an error";
+    }
+    String details = "HTTP status: " + String(status);
+    if (status < 0)
+    {
+      details += " (" + http.errorToString(status) + ")";
+    }
     http.end();
+    showError(message, details);
     return DownloadResult::failed;
   }
 
@@ -197,14 +438,14 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
                 contentType.c_str(), contentLength);
   if (contentLength > 0 && static_cast<size_t>(contentLength) > MAX_PNG_SIZE)
   {
-    Serial.printf("Invalid Content-Length: %d\n", contentLength);
     http.end();
+    showError("Image is too large", "Content-Length: " + String(contentLength) + " bytes");
     return DownloadResult::failed;
   }
   if (!contentType.startsWith("image/png"))
   {
-    Serial.printf("Unexpected Content-Type: %s\n", contentType.c_str());
     http.end();
+    showError("Link did not return a PNG image", "Content-Type: " + contentType);
     return DownloadResult::failed;
   }
 
@@ -219,9 +460,11 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
     http.end();
     if (written <= 0 || output.overflowed() || image.empty())
     {
-      Serial.printf("Chunked download failed: result=%d, size=%u\n", written,
-                    static_cast<unsigned>(image.size()));
+      const String details = "Result: " + String(written) + ", received: " +
+                             String(static_cast<unsigned>(image.size())) + " bytes";
       image.clear();
+      showError(output.overflowed() ? "Downloaded image is too large" : "Image download failed",
+                details);
       return DownloadResult::failed;
     }
   }
@@ -255,9 +498,10 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
 
     if (received != image.size())
     {
-      Serial.printf("Incomplete download: %u/%u bytes\n",
-                    static_cast<unsigned>(received), static_cast<unsigned>(image.size()));
+      const String details = "Received " + String(static_cast<unsigned>(received)) + " of " +
+                             String(static_cast<unsigned>(image.size())) + " bytes";
       image.clear();
+      showError("Image download was interrupted", details);
       return DownloadResult::failed;
     }
   }
@@ -266,8 +510,8 @@ DownloadResult downloadScreenshot(const String& screenshotUrl, std::vector<uint8
                                image[1] == 'P' && image[2] == 'N' && image[3] == 'G';
   if (!hasPngSignature)
   {
-    Serial.println("Downloaded data is not a PNG file");
     image.clear();
+    showError("Downloaded file is not a valid PNG image");
     return DownloadResult::failed;
   }
 
@@ -299,17 +543,18 @@ bool showPng(const std::vector<uint8_t>& image)
       const_cast<uint8_t*>(image.data()), image.size(), drawPngLine);
   if (result != PNG_SUCCESS)
   {
-    Serial.printf("PNG open error: %d\n", result);
     activePng = nullptr;
+    showError("Cannot open PNG image", "PNG error code: " + String(result));
     return false;
   }
 
   if (activePng->getWidth() != IMAGE_WIDTH || activePng->getHeight() != IMAGE_HEIGHT)
   {
-    Serial.printf("Unexpected PNG dimensions: %dx%d\n",
-                  activePng->getWidth(), activePng->getHeight());
+    const String details = "Expected 800x480, received " + String(activePng->getWidth()) + "x" +
+                           String(activePng->getHeight());
     activePng->close();
     activePng = nullptr;
+    showError("Invalid PNG dimensions", details);
     return false;
   }
 
@@ -327,11 +572,11 @@ bool showPng(const std::vector<uint8_t>& image)
     const int decodeResult = activePng->decode(nullptr, 0);
     if (decodeResult != PNG_SUCCESS)
     {
-      Serial.printf("PNG decode error: %d\n", decodeResult);
       activePng->close();
       activePng = nullptr;
       display.hibernate();
       SPI.end();
+      showError("Cannot decode PNG image", "PNG error code: " + String(decodeResult));
       return false;
     }
   }
@@ -347,14 +592,14 @@ bool showPng(const std::vector<uint8_t>& image)
 
 bool refreshScreen(uint32_t& refreshSeconds)
 {
-  if (!connectWiFi())
+  if (DEVICE_BASE_URL[0] == '\0')
   {
+    showError("Device link is missing", "Set DEVICE_BASE_URL in secrets.h");
     return false;
   }
 
-  if (DEVICE_BASE_URL[0] == '\0')
+  if (!connectWiFi())
   {
-    Serial.println("DEVICE_BASE_URL is empty; copy it from E-Ink Control Desk");
     return false;
   }
 
@@ -406,6 +651,12 @@ void setup()
   Serial.begin(115200);
   delay(200);
   Serial.println("FPC-8612 Wi-Fi weather display: start");
+  WiFi.onEvent(recordWiFiDisconnectReason, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  // The sensor, reset button and battery are optional. A reset button wired
+  // between RESET and GND works in hardware; the JST battery input is managed
+  // by the FireBeetle power circuit. Only the sensor needs firmware support.
+  readOptionalEnvironmentSensor();
 
   // Allocate the download buffer before Wi-Fi/TLS can fragment the heap.
   downloadBuffer.reserve(MAX_PNG_SIZE);
