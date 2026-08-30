@@ -42,6 +42,7 @@ constexpr uint8_t ENV_SENSOR_ADDRESS_LOW = 0x76;
 constexpr uint8_t ENV_SENSOR_ADDRESS_HIGH = 0x77;
 constexpr uint8_t BME280_CHIP_ID = 0x60;
 constexpr uint8_t BMP280_CHIP_ID = 0x58;
+constexpr uint8_t ENV_SENSOR_SAMPLE_COUNT = 3;
 
 // FireBeetle 2 ESP32-E (DFR0654): onboard pack sense is A2 / GPIO34 through a
 // 1 MΩ + 1 MΩ divider, so pack voltage is twice the ADC millivolts. A0/GPIO36
@@ -364,6 +365,68 @@ uint8_t readBmpChipId(uint8_t address)
   return static_cast<uint8_t>(envI2c.read());
 }
 
+float median3(float a, float b, float c)
+{
+  if (a > b)
+  {
+    const float t = a;
+    a = b;
+    b = t;
+  }
+  if (b > c)
+  {
+    const float t = b;
+    b = c;
+    c = t;
+  }
+  if (a > b)
+  {
+    const float t = a;
+    a = b;
+    b = t;
+  }
+  return b;
+}
+
+float altitudeFromPressureHpa(float pressureHpa)
+{
+  return 44330.0f * (1.0f - powf(pressureHpa / 1013.25f, 0.1903f));
+}
+
+void finishEnvironmentReading(bool hasHumidity, const float* temperaturesC, const float* pressuresHpa,
+                              const float* humiditiesPercent, uint8_t sampleCount)
+{
+  if (sampleCount == 0)
+  {
+    return;
+  }
+  latestEnvironment.available = true;
+  latestEnvironment.hasHumidity = hasHumidity;
+  if (sampleCount == 1)
+  {
+    latestEnvironment.temperatureC = temperaturesC[0];
+    latestEnvironment.pressureHpa = pressuresHpa[0];
+    latestEnvironment.humidityPercent = hasHumidity ? humiditiesPercent[0] : 0.0f;
+  }
+  else if (sampleCount == 2)
+  {
+    latestEnvironment.temperatureC = (temperaturesC[0] + temperaturesC[1]) * 0.5f;
+    latestEnvironment.pressureHpa = (pressuresHpa[0] + pressuresHpa[1]) * 0.5f;
+    latestEnvironment.humidityPercent =
+        hasHumidity ? (humiditiesPercent[0] + humiditiesPercent[1]) * 0.5f : 0.0f;
+  }
+  else
+  {
+    latestEnvironment.temperatureC = median3(temperaturesC[0], temperaturesC[1], temperaturesC[2]);
+    latestEnvironment.pressureHpa = median3(pressuresHpa[0], pressuresHpa[1], pressuresHpa[2]);
+    latestEnvironment.humidityPercent =
+        hasHumidity ? median3(humiditiesPercent[0], humiditiesPercent[1], humiditiesPercent[2]) : 0.0f;
+  }
+  latestEnvironment.altitudeM = altitudeFromPressureHpa(latestEnvironment.pressureHpa);
+  Serial.printf("Sensor samples: %u (%s)\n", sampleCount,
+                sampleCount >= 3 ? "median" : "partial");
+}
+
 void logSensorReading()
 {
   if (!latestEnvironment.available)
@@ -524,24 +587,43 @@ void readOptionalEnvironmentSensor()
     bme280.setSampling(Adafruit_BME280::MODE_FORCED, Adafruit_BME280::SAMPLING_X1,
                        Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::SAMPLING_X1,
                        Adafruit_BME280::FILTER_OFF);
-    bme280.takeForcedMeasurement();
-    latestEnvironment.available = true;
-    latestEnvironment.hasHumidity = true;
-    latestEnvironment.temperatureC = bme280.readTemperature();
-    latestEnvironment.pressureHpa = bme280.readPressure() / 100.0f;
-    latestEnvironment.humidityPercent = bme280.readHumidity();
-    latestEnvironment.altitudeM = bme280.readAltitude(1013.25f);
+    float temperaturesC[ENV_SENSOR_SAMPLE_COUNT] = {};
+    float pressuresHpa[ENV_SENSOR_SAMPLE_COUNT] = {};
+    float humiditiesPercent[ENV_SENSOR_SAMPLE_COUNT] = {};
+    uint8_t sampleCount = 0;
+    for (uint8_t i = 0; i < ENV_SENSOR_SAMPLE_COUNT; ++i)
+    {
+      if (!bme280.takeForcedMeasurement())
+      {
+        continue;
+      }
+      temperaturesC[sampleCount] = bme280.readTemperature();
+      pressuresHpa[sampleCount] = bme280.readPressure() / 100.0f;
+      humiditiesPercent[sampleCount] = bme280.readHumidity();
+      sampleCount++;
+    }
+    finishEnvironmentReading(true, temperaturesC, pressuresHpa, humiditiesPercent, sampleCount);
   }
   else if ((chipId == BMP280_CHIP_ID || chipId == 0) && bmp280.begin(address))
   {
     bmp280.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X1,
                        Adafruit_BMP280::SAMPLING_X1, Adafruit_BMP280::FILTER_OFF,
                        Adafruit_BMP280::STANDBY_MS_1);
-    bmp280.takeForcedMeasurement();
-    latestEnvironment.available = true;
-    latestEnvironment.temperatureC = bmp280.readTemperature();
-    latestEnvironment.pressureHpa = bmp280.readPressure() / 100.0f;
-    latestEnvironment.altitudeM = bmp280.readAltitude(1013.25f);
+    float temperaturesC[ENV_SENSOR_SAMPLE_COUNT] = {};
+    float pressuresHpa[ENV_SENSOR_SAMPLE_COUNT] = {};
+    float humiditiesPercent[ENV_SENSOR_SAMPLE_COUNT] = {};
+    uint8_t sampleCount = 0;
+    for (uint8_t i = 0; i < ENV_SENSOR_SAMPLE_COUNT; ++i)
+    {
+      if (!bmp280.takeForcedMeasurement())
+      {
+        continue;
+      }
+      temperaturesC[sampleCount] = bmp280.readTemperature();
+      pressuresHpa[sampleCount] = bmp280.readPressure() / 100.0f;
+      sampleCount++;
+    }
+    finishEnvironmentReading(false, temperaturesC, pressuresHpa, humiditiesPercent, sampleCount);
   }
   else
   {
