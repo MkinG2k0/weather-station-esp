@@ -43,14 +43,15 @@ constexpr uint8_t ENV_SENSOR_ADDRESS_HIGH = 0x77;
 constexpr uint8_t BME280_CHIP_ID = 0x60;
 constexpr uint8_t BMP280_CHIP_ID = 0x58;
 
-// FireBeetle 2 ESP32-E (DFR0654): battery sense is A0 / GPIO36 through a 1:1
-// divider, so pack voltage is twice the ADC millivolts. No pack → leave the
-// query parameter off, same as a missing BMP/BME sensor.
-constexpr int BATTERY_ADC_PIN = 36;
+// FireBeetle 2 ESP32-E (DFR0654): onboard pack sense is A2 / GPIO34 through a
+// 1 MΩ + 1 MΩ divider, so pack voltage is twice the ADC millivolts. A0/GPIO36
+// is not wired to the PH2.0 connector. No pack → leave the query parameter
+// off, same as a missing BMP/BME sensor. Max includes 4.4 V high-voltage cells.
+constexpr int BATTERY_ADC_PIN = 34;
 constexpr uint32_t BATTERY_DIVIDER = 2;
 constexpr uint32_t BATTERY_SAMPLE_COUNT = 8;
 constexpr float BATTERY_PRESENT_MIN_V = 3.05f;
-constexpr float BATTERY_PRESENT_MAX_V = 4.40f;
+constexpr float BATTERY_PRESENT_MAX_V = 4.50f;
 
 constexpr uint32_t WIFI_TIMEOUT_MS = 30000;
 constexpr uint32_t DOWNLOAD_TIMEOUT_MS = 30000;
@@ -68,6 +69,7 @@ constexpr uint16_t TEMP_LOG_MAX_POINTS = 48;
 constexpr uint32_t TEMP_LOG_MAX_AGE_SEC = 2UL * 24UL * 3600UL;
 constexpr uint16_t TEMP_LOG_SEND_POINTS = 48;
 constexpr uint32_t NTP_MIN_UNIX = 1600000000UL;
+constexpr int STATUS_LED = 2; // FireBeetle onboard LED, D9 / IO2
 
 // 80 display rows per page keep the PNG decoder in static memory and avoid
 // heap fragmentation. The complete 800x480 image is rendered in 6 passes.
@@ -216,6 +218,18 @@ String encodeTemperatureHist()
     encoded += String(tempLog[index].tenth);
   }
   return encoded;
+}
+
+void blinkStatusLed(int times)
+{
+  pinMode(STATUS_LED, OUTPUT);
+  for (int i = 0; i < times; ++i)
+  {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(160);
+    digitalWrite(STATUS_LED, LOW);
+    delay(160);
+  }
 }
 
 bool syncNetworkTime()
@@ -403,6 +417,7 @@ void readOptionalBattery()
 {
   latestBattery = BatteryReading{};
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  analogReadMilliVolts(BATTERY_ADC_PIN);
   delay(8);
 
   uint64_t milliSum = 0;
@@ -413,17 +428,20 @@ void readOptionalBattery()
   }
   const float pinVolts = (milliSum / static_cast<float>(BATTERY_SAMPLE_COUNT)) / 1000.0f;
   const float packVolts = pinVolts * static_cast<float>(BATTERY_DIVIDER);
+  const int percent = lipoPercentFromVoltage(packVolts);
 
   if (packVolts < BATTERY_PRESENT_MIN_V || packVolts > BATTERY_PRESENT_MAX_V)
   {
-    Serial.printf("Battery: not present (%.2f V on pack sense)\n", packVolts);
+    Serial.printf("Battery: not present (%.2f V on GPIO %d pack sense -> %d%%)\n",
+                  packVolts, BATTERY_ADC_PIN, percent);
     return;
   }
 
   latestBattery.available = true;
   latestBattery.voltage = packVolts;
-  latestBattery.percent = lipoPercentFromVoltage(packVolts);
-  Serial.printf("Battery: %.2f V -> %d%%\n", latestBattery.voltage, latestBattery.percent);
+  latestBattery.percent = percent;
+  Serial.printf("Battery: %.2f V -> %d%% (GPIO %d)\n", latestBattery.voltage,
+                latestBattery.percent, BATTERY_ADC_PIN);
 }
 
 void readOptionalEnvironmentSensor()
@@ -1052,6 +1070,7 @@ bool refreshScreen(uint32_t& refreshSeconds)
 [[noreturn]] void sleepFor(uint32_t seconds)
 {
   stopWiFi();
+  digitalWrite(STATUS_LED, LOW);
   Serial.printf("Deep sleep for %lu seconds\n", static_cast<unsigned long>(seconds));
   Serial.flush();
   esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(seconds) * 1000000ULL);
@@ -1063,6 +1082,7 @@ void setup()
 {
   Serial.begin(115200);
   delay(200);
+  blinkStatusLed(3);
   Serial.println("FPC-8612 Wi-Fi weather display: start");
   WiFi.onEvent(recordWiFiDisconnectReason, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 

@@ -263,7 +263,7 @@ pio device monitor --baud 115200
 Один цикл выглядит так:
 
 1. ESP32 просыпается, читает BMP280/BME280 (если он подключён), напряжение
-   аккумулятора на A0 и подключается к Wi-Fi.
+   аккумулятора на A2 (GPIO34) и подключается к Wi-Fi.
 2. Выполняет HTTPS-запрос к `DEVICE_BASE_URL/screen.png` и передаёт показания
    датчика в query (`chip`, `temp_c`, `pressure_hpa`, `altitude_m`, при BME280
    ещё `humidity`). Если Li-Po на JST есть, добавляется `batt_pct`. Сервер
